@@ -1,0 +1,272 @@
+# vim: nospell
+
+version: '3.8'
+
+services:
+  watchtower:
+    container_name: watchtower
+    command: --label-enable --cleanup --interval 3600
+    image: containrrr/watchtower
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    network_mode: none
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  redis:
+    container_name: redis
+    image: redis
+    networks:
+      - traefik
+    restart: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    volumes:
+      - ./redis:/data
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - traefik
+    command:
+      # Traefik API
+      - --ping
+      - --api.dashboard=true
+      # Traefik config file
+      - --providers.file.filename=/config.yml
+      - --providers.file.watch
+      # Entrypoints
+      - --entrypoints.http.address=:80
+      - --entrypoints.http.http.redirections.entrypoint.to=https
+      - --entrypoints.https.address=:443
+      - --entrypoints.https.http.tls.certresolver=godaddy
+      - --entrypoints.https.http.tls.domains="DOMAIN"
+      - --entrypoints.https.http.tls.domains[0].main="DOMAIN"
+      - --entrypoints.https.http.tls.domains[0].sans="*.DOMAIN"
+      - --entrypoints.ping.address=:8082
+      # Docker + docker net
+      - --providers.docker=true
+      - --providers.docker.network=docker_traefik
+      - --providers.docker.exposedbydefault=false
+
+      - --log.level=DEBUG
+      # DNS ACME
+      - --certificatesresolvers.godaddy.acme.email="EMAIL"
+      - --certificatesresolvers.godaddy.acme.dnsChallenge=true
+      - --certificatesresolvers.godaddy.acme.storage=/acme.json
+      - --certificatesresolvers.godaddy.acme.dnsChallenge.provider=godaddy
+      - --certificatesresolvers.godaddy.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory
+
+    environment:
+      - GODADDY_API_KEY_FILE=/run/secrets/GODADDY_API_KEY
+      - GODADDY_API_SECRET_FILE=/run/secrets/GODADDY_API_SECRET
+    ports:
+      - 80:80
+      - 443:443
+      - 8082:8082
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/config.yml:/config.yml:ro
+      - ./traefik/acme.json:/acme.json
+    secrets:
+      - GODADDY_API_KEY
+      - GODADDY_API_SECRET
+    healthcheck:
+      test: traefik healthcheck || exit 1
+      interval: 1m 30s
+      timeout: 10s
+      retries: 3
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      # traefik routing / certs
+      - "traefik.http.routers.traefik-secure.tls=true"
+      - "traefik.http.routers.traefik-secure.service=api@internal"
+      - "traefik.http.routers.traefik-secure.rule=Host(`traefik.DOMAIN`)"
+      - "traefik.http.routers.traefik-secure.entrypoints=https"
+
+  # # #
+  # Bitwarden: the selfhosted Password Manager (Rust Edition)
+  #
+  bitwarden:
+    container_name: bitwarden
+    image: bitwardenrs/server
+    restart: always
+    depends_on:
+      - traefik
+    volumes:
+      - ./bitwarden:/data
+    environment:
+      WEBSOCKET_ENABLED: 'true'
+      SIGNUPS_ALLOWED: 'false'
+      DOMAIN: 'https://bitwarden.DOMAIN'
+    networks:
+      - traefik
+    labels:
+      # Wachtower update
+      - "com.centurylinklabs.watchtower.enable=true"
+
+      # Traefik General
+      - "traefik.enable=true"
+      - "traefik.docker.network=docker_traefik"
+
+      # Traefik web
+      - "traefik.http.routers.bitwarden.entrypoints=http"
+      - "traefik.http.routers.bitwarden.rule=Host(`bitwarden.DOMAIN`)"
+      - "traefik.http.middlewares.bitwarden-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.bitwarden.middlewares=bitwarden-https-redirect"
+      - "traefik.http.routers.bitwarden.service=bitwarden"
+      - "traefik.http.services.bitwarden.loadbalancer.server.port=80"
+
+      # traefik https
+      - "traefik.http.routers.bitwarden-secure.entrypoints=https"
+      - "traefik.http.routers.bitwarden-secure.rule=Host(`bitwarden.DOMAIN`)"
+      - "traefik.http.routers.bitwarden-secure.tls=true"
+      - "traefik.http.routers.bitwarden-secure.service=bitwarden-secure"
+      - "traefik.http.services.bitwarden-secure.loadbalancer.server.port=80"
+
+      # traefik websocket
+      - "traefik.http.routers.bitwarden-ws.entrypoints=https"
+      - "traefik.http.routers.bitwarden-ws.rule=Host(`bitwarden.DOMAIN`) && Path(`/notifications/hub`)"
+      - "traefik.http.middlewares.bitwarden-ws-strip.stripprefix.prefixes=/notifications/hub"
+      - "traefik.http.routers.bitwarden-ws.middlewares=bitwarden-ws-strip"
+      - "traefik.http.routers.bitwarden-ws.tls=true"
+      - "traefik.http.routers.bitwarden-ws.service=bitwarden-ws"
+      - "traefik.http.services.bitwarden-ws.loadbalancer.server.port=3012"
+
+
+
+
+  # # #
+  # Portainer, Docker management
+  #
+  portainer:
+    container_name: portainer
+    image: portainer/portainer-ce:latest
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - traefik
+    depends_on:
+      - traefik
+    environment:
+      - no-analytics
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./portainer:/data
+    labels:
+      # Watchtower
+      - "com.centurylinklabs.watchtower.enable=true"
+
+      # Traefik
+      - "traefik.enable=true"
+      - "traefik.port=9000"
+      - "traefik.docker.network=docker_traefik"
+
+      # Traefik http
+      - "traefik.http.middlewares.test-compress.compress=true"
+      - "traefik.http.routers.portainer.entrypoints=http"
+      - "traefik.http.routers.portainer.rule=Host(`portainer.DOMAIN`)"
+      # Traefik https
+      - "traefik.http.middlewares.portainer-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.portainer.middlewares=portainer-https-redirect"
+      - "traefik.http.routers.portainer-secure.entrypoints=https"
+      - "traefik.http.routers.portainer-secure.rule=Host(`portainer.DOMAIN`)"
+      - "traefik.http.routers.portainer-secure.tls=true"
+      - "traefik.http.routers.portainer-secure.service=portainer"
+      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+  # # #
+  # Nextcloud - a Gdrive/GDocs alternative
+  #
+  nextcloud:
+    container_name: nextcloud
+    image: nextcloud
+    restart: always
+    volumes:
+      - ./nextcloud/config:/var/www/html/config
+      - ./nextcloud/data:/var/www/html/data
+      - ./nextcloud:/var/www/html
+    environment:
+      - NEXTCLOUD_ADMIN_PASSWORD_FILE=/run/secrets/nextcloud_admin_password
+      - NEXTCLOUD_ADMIN_USER_FILE=/run/secrets/nextcloud_admin_user
+      - REDIS_HOST=redis
+    depends_on:
+      - traefik
+      - redis
+    links:
+      - redis:redis
+    networks:
+      - traefik
+    secrets:
+      - nextcloud_admin_password
+      - nextcloud_admin_user
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      # Treafik
+      - "traefik.enable=true"
+      - "traefik.docker.network=docker_traefik"
+      - "traefik.http.middlewares.test-compress.compress=true"
+      # caldev middleware
+      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.permanent=true"
+      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.regex=^https://(.*)/.well-known/(card|cal)dav"
+      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.replacement=https://$${1}/remote.php/dav/"
+      - "traefik.http.middlewares.nextcloud-https.redirectscheme.scheme=https"
+      # routers
+      - "traefik.http.routers.nextcloud-http.entrypoints=http"
+      - "traefik.http.routers.nextcloud-http.rule=Host(`nextcloud.DOMAIN`)"
+      - "traefik.http.routers.nextcloud-http.middlewares=nextcloud-https@docker"
+      - "traefik.http.routers.nextcloud.entrypoints=https"
+      - "traefik.http.routers.nextcloud.rule=Host(`nextcloud.DOMAIN`)"
+      - "traefik.http.routers.nextcloud.middlewares=nextcloud-caldav@docker"
+      - "traefik.http.routers.nextcloud.tls=true"
+
+
+  heimdall:
+    image: linuxserver/heimdall
+    container_name: heimdall
+    restart: unless-stopped
+    networks:
+      - traefik
+    environment:
+      - TZ=America/Chicago
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+      - "treafik.enable=true"
+      - "traefik.docker.network=docker_traefik"
+      - "treafik.http.middlewares.heimdall-https.redirectscheme.scheme=https"
+
+      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=http"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+
+      - "treafik.http.routers.heimdall-http.entrypoints=http"
+      - "treafik.http.routers.heimdall-http.rule=Host(`DOMAIN`)"
+      - "treafik.http.routers.heimdall-http.middlewares=heimdall-https@docker"
+
+      - "treafik.http.routers.heimdall.entrypoints=https"
+      - "traefik.http.routers.heimdall.rule=Host(`DOMAIN`)"
+      - "traefik.http.routers.heimdall.tls=true"
+
+
+networks:
+  traefik:
+    driver: bridge
+
+secrets:
+  nextcloud_admin_password:
+    file: ./nextcloud_admin_password.txt
+  nextcloud_admin_user:
+    file: ./nextcloud_admin_user.txt
+  GODADDY_API_KEY:
+    file: ./godaddyAPI.key
+  GODADDY_API_SECRET:
+    file: ./godaddyAPI.secret
