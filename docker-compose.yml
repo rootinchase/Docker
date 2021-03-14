@@ -1,148 +1,152 @@
-# vim: nospell
-
 version: '3.8'
 
 services:
-  watchtower:
-    container_name: watchtower
-    command: --label-enable --cleanup --interval 3600
-    image: containrrr/watchtower
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    network_mode: none
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-
-  redis:
-    container_name: redis
-    image: redis
-    networks:
-      - traefik
-    restart: always
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    volumes:
-      - ./redis:/data
-
-  traefik:
-    image: traefik:latest
-    container_name: traefik
+  # # #
+  # Monitoring/Metrics
+  #
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
     restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    networks:
-      - traefik
-    command:
-      # Traefik API
-      - --ping
-      - --api.dashboard=true
-      # Traefik config file
-      - --providers.file.filename=/config.yml
-      - --providers.file.watch
-      # Entrypoints
-      - --entrypoints.http.address=:80
-      - --entrypoints.http.http.redirections.entrypoint.to=https
-      - --entrypoints.https.address=:443
-      - --entrypoints.https.http.tls.certresolver=godaddy
-      - --entrypoints.https.http.tls.domains="DOMAIN"
-      - --entrypoints.https.http.tls.domains[0].main="DOMAIN"
-      - --entrypoints.https.http.tls.domains[0].sans="*.DOMAIN"
-      - --entrypoints.ping.address=:8082
-      # Docker + docker net
-      - --providers.docker=true
-      - --providers.docker.network=docker_traefik
-      - --providers.docker.exposedbydefault=false
-
-      - --log.level=DEBUG
-      # DNS ACME
-      - --certificatesresolvers.godaddy.acme.email="EMAIL"
-      - --certificatesresolvers.godaddy.acme.dnsChallenge=true
-      - --certificatesresolvers.godaddy.acme.storage=/acme.json
-      - --certificatesresolvers.godaddy.acme.dnsChallenge.provider=godaddy
-      - --certificatesresolvers.godaddy.acme.caServer=https://acme-staging-v02.api.letsencrypt.org/directory
-
-    environment:
-      - GODADDY_API_KEY_FILE=/run/secrets/GODADDY_API_KEY
-      - GODADDY_API_SECRET_FILE=/run/secrets/GODADDY_API_SECRET
-    ports:
-      - 80:80
-      - 443:443
-      - 8082:8082
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik/config.yml:/config.yml:ro
-      - ./traefik/acme.json:/acme.json
-    secrets:
-      - GODADDY_API_KEY
-      - GODADDY_API_SECRET
+    user: root
     healthcheck:
-      test: traefik healthcheck || exit 1
-      interval: 1m 30s
-      timeout: 10s
-      retries: 3
+      test: "/bin/wget -q -Y off http://localhost:9090/status -O /dev/null > /dev/null 2>&1"
+      interval: 25s
+      timeout: 3s
+      start_period: 60s
+    networks:
+      - net
+    depends_on:
+      - cadvisor
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/prometheus_data:/prometheus
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-      # traefik routing / certs
-      - "traefik.http.routers.traefik-secure.tls=true"
-      - "traefik.http.routers.traefik-secure.service=api@internal"
-      - "traefik.http.routers.traefik-secure.rule=Host(`traefik.DOMAIN`)"
-      - "traefik.http.routers.traefik-secure.entrypoints=https"
+      org.label-schema.group: "monitoring"
+  
+  # # #
+  # influxdb
+  #
+  influxdb:
+    image: influxdb
+    container_name: influxdb
+    restart: unless-stopped
+    networks:
+      - net
+    volumes:
+      - ./influxdb:/var/lib/influxdb
+    env_file:
+      - ./env/influxdb.env
+    labels:
+      org.label-schema.group: "monitoring"
 
   # # #
-  # Bitwarden: the selfhosted Password Manager (Rust Edition)
+  # Telegraf
+  #
+  telegraf:
+    image: telegraf
+    container_name: telegraf
+    restart: always
+    env_file:
+      - ./env/telegraf.env
+    networks:
+      - net
+    volumes:
+     - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+     - /var/run/docker.sock:/var/run/docker.sock:ro
+     - /sys:/rootfs/sys:ro
+     - /proc:/rootfs/proc:ro
+     - /etc:/rootfs/etc:ro
+
+  # # #
+  # DOCKER CONTAINERS METRICS COLLECTOR
+  #
+  cadvisor:
+    image: google/cadvisor
+    container_name: cadvisor
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/cadvisor/healthz || exit 1"]
+      interval: 60s
+      timeout: 3s
+      retries: 0
+    networks:
+      - net
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /cgroup:/cgroup:ro
+    labels:
+      org.label-schema.group: "monitoring"
+  
+  # # #
+  # HOSTS METRICS COLLECTOR
+  # 
+  nodeexporter:
+    image: prom/node-exporter
+    container_name: nodeexporter
+    restart: unless-stopped
+    networks:
+      - net
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    labels:
+      org.label-schema.group: "monitoring"
+
+  # # #
+  # NGINX reverse proxy w/ webUI
+  #
+  proxy:
+    container_name: proxy
+    image: jc21/nginx-proxy-manager:2
+    restart: always
+    ports:
+      - '80:80'
+      - '443:443'
+      - '81:81'
+    environment:
+      DISABLE_IPV6: 'true'
+    volumes:
+      - ./proxy/config.json:/app/config/production.json
+      - ./proxy/data:/data
+      - ./proxy/letsencrypt:/etc/letsencrypt
+    networks:
+      - net
+    restart: unless-stopped
+
+  # # #
+  # Bitwarden: the self hosted Password Manager
   #
   bitwarden:
     container_name: bitwarden
     image: bitwardenrs/server
-    restart: always
+    restart: unless-stopped
     depends_on:
-      - traefik
+      - proxy
     volumes:
       - ./bitwarden:/data
-    environment:
-      WEBSOCKET_ENABLED: 'true'
-      SIGNUPS_ALLOWED: 'false'
-      DOMAIN: 'https://bitwarden.DOMAIN'
+    env_file:
+      ./env/bitwarden.env
     networks:
-      - traefik
-    labels:
-      # Wachtower update
-      - "com.centurylinklabs.watchtower.enable=true"
+      - net
 
-      # Traefik General
-      - "traefik.enable=true"
-      - "traefik.docker.network=docker_traefik"
-
-      # Traefik web
-      - "traefik.http.routers.bitwarden.entrypoints=http"
-      - "traefik.http.routers.bitwarden.rule=Host(`bitwarden.DOMAIN`)"
-      - "traefik.http.middlewares.bitwarden-https-redirect.redirectscheme.scheme=https"
-      - "traefik.http.routers.bitwarden.middlewares=bitwarden-https-redirect"
-      - "traefik.http.routers.bitwarden.service=bitwarden"
-      - "traefik.http.services.bitwarden.loadbalancer.server.port=80"
-
-      # traefik https
-      - "traefik.http.routers.bitwarden-secure.entrypoints=https"
-      - "traefik.http.routers.bitwarden-secure.rule=Host(`bitwarden.DOMAIN`)"
-      - "traefik.http.routers.bitwarden-secure.tls=true"
-      - "traefik.http.routers.bitwarden-secure.service=bitwarden-secure"
-      - "traefik.http.services.bitwarden-secure.loadbalancer.server.port=80"
-
-      # traefik websocket
-      - "traefik.http.routers.bitwarden-ws.entrypoints=https"
-      - "traefik.http.routers.bitwarden-ws.rule=Host(`bitwarden.DOMAIN`) && Path(`/notifications/hub`)"
-      - "traefik.http.middlewares.bitwarden-ws-strip.stripprefix.prefixes=/notifications/hub"
-      - "traefik.http.routers.bitwarden-ws.middlewares=bitwarden-ws-strip"
-      - "traefik.http.routers.bitwarden-ws.tls=true"
-      - "traefik.http.routers.bitwarden-ws.service=bitwarden-ws"
-      - "traefik.http.services.bitwarden-ws.loadbalancer.server.port=3012"
-
-
-
-
-  # # #
+  # # # 
   # Portainer, Docker management
   #
   portainer:
@@ -152,121 +156,225 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - traefik
+      - net
     depends_on:
-      - traefik
+      - proxy
     environment:
       - no-analytics
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./portainer:/data
-    labels:
-      # Watchtower
-      - "com.centurylinklabs.watchtower.enable=true"
 
-      # Traefik
-      - "traefik.enable=true"
-      - "traefik.port=9000"
-      - "traefik.docker.network=docker_traefik"
+  # # #
+  # Jellyfin - A media server
+  #
+  jellyfin:
+    container_name: jellyfin
+    image: ghcr.io/linuxserver/jellyfin:latest
+    restart: unless-stopped
+    networks:
+      - net
+    env_file:
+      - ./env/jellyfin.env
+    ports:
+      - 7359:7359/udp # local Jellyfin discovery
+      - 1900:1900/udp # DLNA Discovery
+    volumes:
+      - ./jellyfin/config:/config
+      - ./jellyfin/cache:/cache
+      - ./media:/media
+    devices:
+      # VAAPI Devices
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
 
-      # Traefik http
-      - "traefik.http.middlewares.test-compress.compress=true"
-      - "traefik.http.routers.portainer.entrypoints=http"
-      - "traefik.http.routers.portainer.rule=Host(`portainer.DOMAIN`)"
-      # Traefik https
-      - "traefik.http.middlewares.portainer-https-redirect.redirectscheme.scheme=https"
-      - "traefik.http.routers.portainer.middlewares=portainer-https-redirect"
-      - "traefik.http.routers.portainer-secure.entrypoints=https"
-      - "traefik.http.routers.portainer-secure.rule=Host(`portainer.DOMAIN`)"
-      - "traefik.http.routers.portainer-secure.tls=true"
-      - "traefik.http.routers.portainer-secure.service=portainer"
-      - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+  # # #
+  # Redis
+  #
+  redis:
+    container_name: redis
+    image: redis:6
+    restart: unless-stopped
+    #env_file:
+    #  - ./env/redis.env
+    volumes:
+      - ./redis:/data
+    networks:
+      - net
 
   # # #
   # Nextcloud - a Gdrive/GDocs alternative
   #
   nextcloud:
     container_name: nextcloud
-    image: nextcloud
+    build: ./dockerfiles/Nextcloud
     restart: always
+    # env_file:
+    #   - ./env/nextcloud.env
     volumes:
       - ./nextcloud/config:/var/www/html/config
       - ./nextcloud/data:/var/www/html/data
-      - ./nextcloud:/var/www/html
-    environment:
-      - NEXTCLOUD_ADMIN_PASSWORD_FILE=/run/secrets/nextcloud_admin_password
-      - NEXTCLOUD_ADMIN_USER_FILE=/run/secrets/nextcloud_admin_user
-      - REDIS_HOST=redis
+      - ./nextcloud/main:/var/www/html
     depends_on:
-      - traefik
-      - redis
-    links:
-      - redis:redis
+      - proxy
     networks:
-      - traefik
-    secrets:
-      - nextcloud_admin_password
-      - nextcloud_admin_user
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-      # Treafik
-      - "traefik.enable=true"
-      - "traefik.docker.network=docker_traefik"
-      - "traefik.http.middlewares.test-compress.compress=true"
-      # caldev middleware
-      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.permanent=true"
-      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.regex=^https://(.*)/.well-known/(card|cal)dav"
-      - "traefik.http.middlewares.nextcloud-caldav.redirectregex.replacement=https://$${1}/remote.php/dav/"
-      - "traefik.http.middlewares.nextcloud-https.redirectscheme.scheme=https"
-      # routers
-      - "traefik.http.routers.nextcloud-http.entrypoints=http"
-      - "traefik.http.routers.nextcloud-http.rule=Host(`nextcloud.DOMAIN`)"
-      - "traefik.http.routers.nextcloud-http.middlewares=nextcloud-https@docker"
-      - "traefik.http.routers.nextcloud.entrypoints=https"
-      - "traefik.http.routers.nextcloud.rule=Host(`nextcloud.DOMAIN`)"
-      - "traefik.http.routers.nextcloud.middlewares=nextcloud-caldav@docker"
-      - "traefik.http.routers.nextcloud.tls=true"
+      - net
+  
+  # # # 
+  # WebMap 
+  #
+  webmap:
+    image: reborntc/webmap
+    container_name: webmap
+    restart: unless-stopped
+    depends_on: 
+      - proxy
+    volumes:
+      - ./webmap:/opt/xml
+    networks:
+      - net
+      - default
 
+  # # # 
+  # Dozzle - Docker Log viewer
+  #
+  dozzle:
+    image: amir20/dozzle
+    container_name: dozzle
+    restart: unless-stopped
+    depends_on:
+      - proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - net
+  
 
+  # # #
+  # WikiJS - A wiki
+  #
+  wikijs:
+    image: ghcr.io/linuxserver/wikijs
+    container_name: wikijs
+    env_file:
+      - ./env/wikijs.env
+    depends_on:
+      - proxy
+    volumes:
+      - ./wiki/config:/config
+      - ./wiki/data:/data
+    networks:
+      - net
+    restart: unless-stopped
+  
+  # # #
+  # Heimdall, homepage
+  #
   heimdall:
     image: linuxserver/heimdall
     container_name: heimdall
-    restart: unless-stopped
+    restart: always
     networks:
-      - traefik
-    environment:
-      - TZ=America/Chicago
+      - net
+    volumes:
+      - ./heimdall:/config
+    depends_on:
+      - proxy
+    env_file:
+      - ./env/heimdall.env
+  # # #
+  # Homer
+  #
+  homer:
+    image: b4bz/homer
+    container_name: homer
+    restart: unless-stopped
+    volumes:
+      - ./homer:/www/assets
+    networks:
+      - net
+    depends_on:
+      - proxy
+
+  # # #
+  # WEB BASED UI VISUALISATION OF THE METRICS
+  #
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    user: root
+    networks:
+      - net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --tries=1 --spider localhost:3000/api/health && echo 'ready'"]
+      interval: 10s
+      retries: 3
+    env_file:
+      - ./env/grafana.env
+    volumes:
+      - ./grafana/grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/provisioning/grafana.ini:/etc/grafana/grafana.ini:ro
     labels:
-      - "com.centurylinklabs.watchtower.enable=true"
+      org.label-schema.group: "monitoring"
 
-      - "treafik.enable=true"
-      - "traefik.docker.network=docker_traefik"
-      - "treafik.http.middlewares.heimdall-https.redirectscheme.scheme=https"
+  # # #
+  # Snipe-IT - Asset tracking
+  #
+  snipe:
+    image: snipe/snipe-it
+    container_name: snipe
+    restart: unless-stopped
+    env_file:
+      - ./env/snipe.env
+    volumes:
+      - ./snipe:/var/lib/snipeit
+    networks:
+      - net
 
-      - "traefik.http.routers.http-catchall.rule=hostregexp(`{host:.+}`)"
-      - "traefik.http.routers.http-catchall.entrypoints=http"
-      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+  # # #
+  # Photoprism
+  # 
+  photoprism:
+    # Use photoprism/photoprism:preview instead for testing preview builds:
+    image: photoprism/photoprism:latest
+    container_name: photoprism
+    restart: unless-stopped
+    env_file:
+      - ./env/photoprism.env
+    networks:
+      - net
+    volumes:
+      # Mounting an import folder is optional (see docs):
+      - ./photos:/photoprism/import
+      - ./photoprism:/photoprism/storage
 
-      - "treafik.http.routers.heimdall-http.entrypoints=http"
-      - "treafik.http.routers.heimdall-http.rule=Host(`DOMAIN`)"
-      - "treafik.http.routers.heimdall-http.middlewares=heimdall-https@docker"
+  # # #
+  # Keycloack SSO
+  #
+  keycloak:
+    image: quay.io/keycloak/keycloak
+    container_name: keycloak
+    restart: unless-stopped
+    env_file:
+      - ./env/keycloak.env
+    networks:
+      - net
 
-      - "treafik.http.routers.heimdall.entrypoints=https"
-      - "traefik.http.routers.heimdall.rule=Host(`DOMAIN`)"
-      - "traefik.http.routers.heimdall.tls=true"
+
+#logging:
+#    log_driver: syslog
+#      log_opt:
+#        tag: "{{docker}}/{{.Name}}"
+#        syslog-address: "unix:///dev/log"
 
 
 networks:
-  traefik:
+  net:
     driver: bridge
-
-secrets:
-  nextcloud_admin_password:
-    file: ./nextcloud_admin_password.txt
-  nextcloud_admin_user:
-    file: ./nextcloud_admin_user.txt
-  GODADDY_API_KEY:
-    file: ./godaddyAPI.key
-  GODADDY_API_SECRET:
-    file: ./godaddyAPI.secret
+    ipam: 
+      driver: default
+      config:
+        - subnet: 172.27.0.0/23
